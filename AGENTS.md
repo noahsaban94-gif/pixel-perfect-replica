@@ -28,3 +28,10 @@ use the editor.
   own key and store it in Secrets.
 - **Secrets.** Lovable manages them. Do not put secret values in the repo.
 <!-- LOVABLE:END -->
+
+## Application architecture
+- Use TanStack Start server functions for Sheets access; return allowlisted customer-safe DTOs so internal columns never enter browser data.
+- Authenticate phone ownership through Cloud SMS OTP before reading customer mappings; phone input or name search alone must never authorize account access.
+- Keep public catalog cache separate from private no-store account requests; the shared new-customer number must never group customer histories.
+- Store only non-sensitive cart SKU/quantity drafts locally; never cache private account records in the service worker.
+- Use the single guarded PWA registration module and generated Workbox worker; previews and OAuth endpoints must not be intercepted.
