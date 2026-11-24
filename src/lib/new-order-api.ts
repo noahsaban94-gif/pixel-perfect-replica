@@ -8,7 +8,7 @@ import { isCustomerProduct, NEW_CUSTOMER_ID, normalizePhone } from './portal-dom
 import { generateOpaqueToken } from './magic-session';
 
 const DEFAULT_WEBAPP_URL =
-  'https://script.google.com/macros/s/AKfycbxIG20m2ikq3UIPVEic0PvwgH2f2oEdw7OlyFX7xyQuKMf_Jo55AW3fd9cq75T-ks3vuw/exec';
+  'https://script.google.com/macros/s/AKfycbzXhFhcbhre2kikxoVPFely45DOMHWAd_j4Fu8_yRhWOAWKrCj6jXBO-iHTaWD_qWH4LA/exec';
 
 const WEBAPP_URL =
   process.env['APPS_SCRIPT_URL'] ??
@@ -266,12 +266,39 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
       const list = c.phones ?? (c.phone ? [c.phone] : []);
       return list.some((p) => digitsPhone(String(p)) === dig);
     });
-    if (hit.length > 1) {
-      throw new Error('המספר משויך למספר כרטיסים. יש לפנות לסבן לאימות השיוך.');
+
+    if (hit.length > 0) {
+      const primary: AppsScriptCustomer = { ...hit[0], sites: [...(hit[0].sites ?? [])] };
+      const primaryNo = String(primary.customerNo ?? primary.comaxPrimaryNo ?? primary.id ?? '').trim();
+      const linkedSet = new Set<string>([
+        ...(primary.comaxLinkedIds ?? []).map(String),
+        ...(primary.linkedIds ?? []).map(String),
+      ]);
+      const getAddr = (s: string | AppsScriptSite) =>
+        typeof s === 'string' ? s.trim() : String(s?.address ?? '').trim();
+      const seenSites = new Set((primary.sites ?? []).map(getAddr).filter(Boolean));
+
+      for (let i = 1; i < hit.length; i++) {
+        const extra = hit[i];
+        const extraNo = String(extra.customerNo ?? extra.comaxPrimaryNo ?? extra.id ?? '').trim();
+        if (extraNo && extraNo !== primaryNo) linkedSet.add(extraNo);
+        for (const l of [...(extra.comaxLinkedIds ?? []), ...(extra.linkedIds ?? [])]) {
+          if (l) linkedSet.add(String(l));
+        }
+        for (const s of extra.sites ?? []) {
+          const addr = getAddr(s);
+          if (addr && !seenSites.has(addr)) {
+            primary.sites!.push(s);
+            seenSites.add(addr);
+          }
+        }
+      }
+
+      primary.comaxLinkedIds = Array.from(linkedSet);
+      return mapCustomer({ ...primary, phone: normalized || dig });
     }
-    if (hit[0]) return mapCustomer({ ...hit[0], phone: normalized || dig });
-  } catch (e) {
-    if (e instanceof Error && e.message.includes('מספר כרטיסים')) throw e;
+  } catch {
+    // fallback to new customer if lookup fails
   }
 
   return {
