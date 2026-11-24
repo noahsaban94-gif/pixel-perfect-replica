@@ -1,16 +1,13 @@
 /**
  * Server-only client for the NewOrder Apps Script Web App.
- * Aligned with NewOrder.gs handlers:
- *   handleGetOrderBootstrapData_
- *   handleInjectNewOrder_
- *   handleUpdateOrderCustomerNumber_
+ * Handlers: bootstrap, inject, updateCustomerNumber, magic links.
  * Never import this file from client components.
  */
 
 import type { Customer, Product } from './portal-domain';
 import { isCustomerProduct, NEW_CUSTOMER_ID, normalizePhone } from './portal-domain';
+import { generateOpaqueToken } from './magic-session';
 
-/** Working deployment verified 2026-11-24 – 59 customers, 2489 products */
 const DEFAULT_WEBAPP_URL =
   'https://script.google.com/macros/s/AKfycbxIG20m2ikq3UIPVEic0PvwgH2f2oEdw7OlyFX7xyQuKMf_Jo55AW3fd9cq75T-ks3vuw/exec';
 
@@ -24,10 +21,6 @@ const API_TOKEN = process.env['API_TOKEN'] ?? '';
 if (!API_TOKEN && process.env.NODE_ENV === 'production') {
   console.error('[new-order-api] API_TOKEN is not set – protected actions will fail');
 }
-
-// ---------------------------------------------------------------------------
-// Types returned by NewOrder.gs (subset we consume)
-// ---------------------------------------------------------------------------
 
 export type AppsScriptProduct = {
   sku: string;
@@ -44,18 +37,11 @@ export type AppsScriptProduct = {
   image?: string;
   technical?: string;
   palletCapacity?: number | null;
-  defaultWarehouse?: string;
-  recommendedDriver?: string;
-  mediaCode?: string;
 };
 
 export type AppsScriptSite = {
   address?: string;
   city?: string;
-  p80StayMin?: number | null;
-  roadKmFromHarash?: number | null;
-  roadKmFromTalmid?: number | null;
-  defaultUnloadType?: string;
 };
 
 export type AppsScriptCustomer = {
@@ -65,27 +51,19 @@ export type AppsScriptCustomer = {
   aliases?: string[];
   phones?: string[];
   phone?: string;
-  contactName?: string;
   defaultSiteAddress?: string;
-  typicalUnloadType?: string;
-  recommendedTruck?: string;
-  masterId?: string;
   comaxPrimaryNo?: string;
   comaxLinkedIds?: string[];
   linkedIds?: string[];
-  driveFolderUrl?: string;
   sites?: (string | AppsScriptSite)[];
   preferredSite?: string;
   isPendingComax?: boolean;
   exempt?: boolean;
+  magicToken?: string;
 };
 
-export type BootstrapData = {
-  customers: Customer[];
-  products: Product[];
-};
+export type BootstrapData = { customers: Customer[]; products: Product[] };
 
-/** Portal-side payload (mapped to Apps Script shape in injectOrder) */
 export type InjectOrderPayload = {
   orderId?: string;
   customerNo: string;
@@ -114,22 +92,25 @@ export type InjectOrderResult = {
   rowNumber?: number;
 };
 
+export type MagicLinkResult = {
+  customerNo: string;
+  name: string;
+  phone: string;
+  magicToken: string;
+  magicUrl: string;
+  rowNumber?: number;
+};
+
 type AppsScriptResponse<T = unknown> =
   | { success: true; ok?: true; data?: T; [key: string]: unknown }
   | { success: false; ok?: false; error?: string; message?: string };
-
-// ---------------------------------------------------------------------------
-// Low-level transport
-// ---------------------------------------------------------------------------
 
 async function callAppsScript<T>(
   action: string,
   params: Record<string, unknown> = {},
   method: 'GET' | 'POST' = 'GET',
 ): Promise<T> {
-  if (!WEBAPP_URL) {
-    throw new Error('שרת ההזמנות אינו מוגדר (APPS_SCRIPT_URL חסר)');
-  }
+  if (!WEBAPP_URL) throw new Error('שרת ההזמנות אינו מוגדר (APPS_SCRIPT_URL חסר)');
 
   const url = new URL(WEBAPP_URL);
   let response: Response;
@@ -148,15 +129,8 @@ async function callAppsScript<T>(
   } else {
     response = await fetch(url.toString(), {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        action,
-        token: API_TOKEN || undefined,
-        ...params,
-      }),
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ action, token: API_TOKEN || undefined, ...params }),
       redirect: 'follow',
     });
   }
@@ -168,19 +142,13 @@ async function callAppsScript<T>(
   }
 
   const json = (await response.json()) as AppsScriptResponse<T>;
-
   if (json.success === false || json.ok === false) {
     throw new Error(json.error || json.message || 'הפעולה נכשלה בשרת ההזמנות');
   }
-
   if ('data' in json && json.data !== undefined) return json.data as T;
   const { success: _s, ok: _o, error: _e, message: _m, ...rest } = json as Record<string, unknown>;
   return rest as T;
 }
-
-// ---------------------------------------------------------------------------
-// Mappers
-// ---------------------------------------------------------------------------
 
 function mapProduct(raw: AppsScriptProduct): Product | null {
   const sku = String(raw.sku ?? '').trim();
@@ -191,35 +159,21 @@ function mapProduct(raw: AppsScriptProduct): Product | null {
   const deposit = String(raw.deposit ?? '').trim();
   const weight = Number(raw.weightKgPerUnit ?? raw.weight ?? 0) || 0;
   const image = String(raw.imageUrl ?? raw.image ?? '').trim();
-
-  let keywords = '';
-  if (Array.isArray(raw.slangKeywords)) {
-    keywords = raw.slangKeywords.join(', ');
-  } else {
-    keywords = String(raw.slangKeywords ?? raw.keywords ?? '').trim();
-  }
-
-  const technical = String(raw.technical ?? '').trim();
-  const unit = String(raw.unit ?? "יח'").trim();
-  const category = String(raw.category ?? 'כללי').trim();
-
-  let palletCapacity: number | null = raw.palletCapacity ?? null;
-  if (palletCapacity == null) {
-    const m = deposit.match(/(\d+)\s*(?:בלוקים|יחידות|יח׳|יח')/);
-    if (m) palletCapacity = Number(m[1]);
-  }
+  let keywords = Array.isArray(raw.slangKeywords)
+    ? raw.slangKeywords.join(', ')
+    : String(raw.slangKeywords ?? raw.keywords ?? '').trim();
 
   return {
     sku,
     name,
-    category,
-    unit,
+    category: String(raw.category ?? 'כללי').trim(),
+    unit: String(raw.unit ?? "יח'").trim(),
     keywords,
-    technical,
+    technical: String(raw.technical ?? '').trim(),
     deposit,
     weight,
     image,
-    palletCapacity,
+    palletCapacity: raw.palletCapacity ?? null,
   };
 }
 
@@ -227,23 +181,17 @@ function mapCustomer(raw: AppsScriptCustomer): Customer {
   const id =
     String(raw.comaxPrimaryNo ?? raw.customerNo ?? raw.id ?? NEW_CUSTOMER_ID).trim() ||
     NEW_CUSTOMER_ID;
-
   const linkedIds = [...(raw.comaxLinkedIds ?? []), ...(raw.linkedIds ?? [])]
     .map((v) => String(v).trim())
     .filter(Boolean);
-
   const phones = (raw.phones ?? (raw.phone ? [raw.phone] : []))
     .map((p) => normalizePhone(String(p)))
     .filter(Boolean);
-
   const sites = (raw.sites ?? [])
-    .map((s) => {
-      if (typeof s === 'string') return s.trim();
-      if (s && typeof s === 'object' && s.address) return String(s.address).trim();
-      return '';
-    })
+    .map((s) =>
+      typeof s === 'string' ? s.trim() : s?.address ? String(s.address).trim() : '',
+    )
     .filter(Boolean);
-
   const preferred =
     String(raw.preferredSite ?? raw.defaultSiteAddress ?? '').trim() || sites[0] || '';
 
@@ -258,10 +206,6 @@ function mapCustomer(raw: AppsScriptCustomer): Customer {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 let catalogCache: { expires: number; products: Product[] } | null = null;
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 
@@ -269,36 +213,25 @@ export async function ping(): Promise<{ version?: string }> {
   return callAppsScript('ping');
 }
 
-/**
- * Catalog = products from handleGetOrderBootstrapData_.
- * getCatalog is an alias that returns the same bootstrap payload.
- */
 export async function getCatalog(): Promise<Product[]> {
-  if (catalogCache && catalogCache.expires > Date.now()) {
-    return catalogCache.products;
-  }
-
+  if (catalogCache && catalogCache.expires > Date.now()) return catalogCache.products;
   const raw = await callAppsScript<{ products?: AppsScriptProduct[] }>('getOrderBootstrapData');
   const products = (raw.products ?? []).map(mapProduct).filter((p): p is Product => p !== null);
   catalogCache = { expires: Date.now() + CATALOG_TTL_MS, products };
   return products;
 }
 
-/** Full bootstrap (customers + products) via handleGetOrderBootstrapData_ */
 export async function getBootstrap(): Promise<BootstrapData> {
   const raw = await callAppsScript<{
     customers?: AppsScriptCustomer[];
     products?: AppsScriptProduct[];
   }>('getOrderBootstrapData');
-
   const products = (raw.products ?? []).map(mapProduct).filter((p): p is Product => p !== null);
   const customers = (raw.customers ?? []).map(mapCustomer);
-
   catalogCache = { expires: Date.now() + CATALOG_TTL_MS, products };
   return { customers, products };
 }
 
-/** Resolve customer by phone using bootstrap data. */
 export async function getCustomerByPhone(phone: string): Promise<Customer> {
   const normalized = normalizePhone(phone);
   if (!normalized) {
@@ -312,7 +245,6 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
       linkedIds: [],
     };
   }
-
   try {
     const raw = await callAppsScript<{ customers?: AppsScriptCustomer[] }>('getOrderBootstrapData');
     const hit = (raw.customers ?? []).filter((c) =>
@@ -325,7 +257,6 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
   } catch (e) {
     if (e instanceof Error && e.message.includes('מספר כרטיסים')) throw e;
   }
-
   return {
     id: NEW_CUSTOMER_ID,
     name: '',
@@ -337,10 +268,14 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
   };
 }
 
-/**
- * Inject order → handleInjectNewOrder_
- * Body: customerNo, customerName, address, itemsJson, contactPhone, contactName, deliveryDate, notes
- */
+export async function getCustomerByNo(customerNo: string): Promise<Customer | null> {
+  const raw = await callAppsScript<{ customers?: AppsScriptCustomer[] }>('getOrderBootstrapData');
+  const hit = (raw.customers ?? []).find(
+    (c) => String(c.customerNo ?? c.comaxPrimaryNo ?? '') === String(customerNo),
+  );
+  return hit ? mapCustomer(hit) : null;
+}
+
 export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOrderResult> {
   const itemsJson = JSON.stringify(
     payload.lines.map((l) => ({
@@ -350,9 +285,8 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
       unit: l.unit || "יח'",
     })),
   );
-
   let mergedItems = itemsJson;
-  if (payload.deposits && payload.deposits.length) {
+  if (payload.deposits?.length) {
     try {
       const a = JSON.parse(itemsJson);
       const b = payload.deposits.map((d) => ({
@@ -363,10 +297,9 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
       }));
       mergedItems = JSON.stringify([...a, ...b]);
     } catch {
-      /* keep items only */
+      /* keep items */
     }
   }
-
   const body = {
     customerNo: payload.customerNo,
     customerName: payload.customerName,
@@ -375,7 +308,6 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
     contactName: payload.contactName,
     phone: payload.contactPhone,
     deliveryDate: payload.deliveryDate,
-    deliveryWindow: '',
     notes: [payload.project ? `פרויקט: ${payload.project}` : '', payload.notes || '']
       .filter(Boolean)
       .join('\n'),
@@ -384,9 +316,7 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
     itemsJson: mergedItems,
     wazeUrl: '',
   };
-
   const result = await callAppsScript<InjectOrderResult>('injectNewOrder', body, 'POST');
-
   return {
     orderId: result.orderId ?? payload.orderId ?? '',
     customerNo: result.customerNo,
@@ -410,8 +340,80 @@ export async function updateOrderCustomerNumber(
   );
 }
 
-export async function getCustomerOrders(_customerNo: string): Promise<
-  {
+/**
+ * Issue (or rotate) a per-customer magic link token and persist it on תיקי_לקוחות.
+ * Requires Apps Script action: issueCustomerMagicLink
+ */
+export async function issueCustomerMagicLink(opts: {
+  customerNo?: string;
+  phone?: string;
+  baseUrl: string;
+  rotate?: boolean;
+}): Promise<MagicLinkResult> {
+  const opaque = generateOpaqueToken();
+  try {
+    const result = await callAppsScript<
+      MagicLinkResult & { magicToken?: string }
+    >(
+      'issueCustomerMagicLink',
+      {
+        customerNo: opts.customerNo || '',
+        phone: opts.phone || '',
+        magicToken: opaque,
+        rotate: opts.rotate !== false,
+        baseUrl: opts.baseUrl,
+      },
+      'POST',
+    );
+    const token = result.magicToken || opaque;
+    const magicUrl =
+      result.magicUrl ||
+      `${opts.baseUrl.replace(/\/$/, '')}/auth/magic?t=${encodeURIComponent(token)}`;
+    return {
+      customerNo: result.customerNo,
+      name: result.name,
+      phone: result.phone,
+      magicToken: token,
+      magicUrl,
+      rowNumber: result.rowNumber,
+    };
+  } catch (e) {
+    // Fallback when Apps Script handler not deployed yet: resolve customer locally
+    // and return a link that validates via phone+token only after GAS is wired.
+    const msg = e instanceof Error ? e.message : '';
+    if (!msg.includes('unknown_action') && !msg.includes('not defined')) throw e;
+
+    let customer: Customer | null = null;
+    if (opts.customerNo) customer = await getCustomerByNo(opts.customerNo);
+    else if (opts.phone) customer = await getCustomerByPhone(opts.phone);
+
+    if (!customer || customer.id === NEW_CUSTOMER_ID) {
+      throw new Error('לא נמצא לקוח קיים. יש ליצור לינק רק ללקוח רשום בתיקי הלקוחות.');
+    }
+
+    throw new Error(
+      'יש להוסיף את handleIssueCustomerMagicLink_ ב-Apps Script (ראה הוראות) כדי לתעד את הטוקן בגיליון.',
+    );
+  }
+}
+
+/** Validate opaque magic token from the customer sheet. */
+export async function validateCustomerMagicToken(magicToken: string): Promise<{
+  customerNo: string;
+  name: string;
+  phone: string;
+}> {
+  const result = await callAppsScript<{
+    customerNo: string;
+    name: string;
+    phone: string;
+  }>('validateCustomerMagicToken', { magicToken }, 'POST');
+  if (!result.customerNo) throw new Error('קישור לא תקין או שפג תוקפו');
+  return result;
+}
+
+export async function getCustomerOrders(_customerNo: string) {
+  return [] as {
     id: string;
     date: string;
     address: string;
@@ -420,15 +422,18 @@ export async function getCustomerOrders(_customerNo: string): Promise<
     products: string;
     weight: string;
     lines: { sku: string; quantity: number }[];
-  }[]
-> {
-  return [];
+  }[];
 }
 
-export async function getCustomerDocuments(_customerNo: string): Promise<
-  { id: string; date: string; address: string; status: string; url: string; name: string }[]
-> {
-  return [];
+export async function getCustomerDocuments(_customerNo: string) {
+  return [] as {
+    id: string;
+    date: string;
+    address: string;
+    status: string;
+    url: string;
+    name: string;
+  }[];
 }
 
 export function toThumbnailUrl(imageUrl: string): string {
