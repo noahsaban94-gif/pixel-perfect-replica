@@ -4,13 +4,14 @@ import {
   getCatalog as fetchCatalog,
   getCustomerByPhone,
   getCustomerByNo,
+  resolveCustomer,
   getCustomerOrders,
   getCustomerDocuments,
   injectOrder,
   issueCustomerMagicLink,
   validateCustomerMagicToken,
 } from './new-order-api';
-import { orderSchema, orderMessage, calculateOrder, phoneSchema, NEW_CUSTOMER_ID } from './portal-domain';
+import { orderSchema, orderMessage, calculateOrder, NEW_CUSTOMER_ID } from './portal-domain';
 import { signMagicSession, verifyMagicSession } from './magic-session';
 import { setResponseHeader } from '@tanstack/react-start/server';
 import { z } from 'zod';
@@ -33,41 +34,40 @@ export const getCatalog = createServerFn({ method: 'GET' }).handler(async () => 
   }
 });
 
-/** Request a personal magic link for an existing customer (by phone). */
+/** Request a personal magic link – phone OR customer number. */
 export const requestMagicLink = createServerFn({ method: 'POST' })
   .inputValidator((input) =>
     z
       .object({
-        phone: phoneSchema,
+        /** Israeli mobile or Comax customer number */
+        query: z.string().trim().min(4).max(20),
         baseUrl: z.string().url(),
       })
       .parse(input),
   )
   .handler(async ({ data }) => {
     setResponseHeader('Cache-Control', 'no-store');
-    const customer = await getCustomerByPhone(data.phone);
+    const customer = await resolveCustomer(data.query);
     if (customer.id === NEW_CUSTOMER_ID) {
-      throw new Error('לא נמצא לקוח רשום עם מספר זה. פנה לסבן לפתיחת כרטיס.');
+      throw new Error(
+        'לא נמצא לקוח רשום. נסה נייד כמו 050-5669924 או מספר לקוח כמו 612108.',
+      );
     }
     const link = await issueCustomerMagicLink({
       customerNo: customer.id,
-      phone: data.phone,
+      phone: customer.phone,
       baseUrl: data.baseUrl,
       rotate: true,
     });
-    // Do not expose full token to unauthenticated browser in production logs;
-    // return the URL so staff/WhatsApp can share it, or customer sees "נשלח".
     return {
       ok: true as const,
       customerNo: link.customerNo,
       name: link.name,
       magicUrl: link.magicUrl,
-      // masked hint only
-      phoneHint: data.phone.replace(/(\d{3})\d{4}(\d{3})/, '$1****$2'),
+      phoneHint: (customer.phone || data.query).replace(/(\d{3})\d{4}(\d{3})/, '$1****$2'),
     };
   });
 
-/** Redeem opaque sheet token → signed session string for localStorage. */
 export const redeemMagicLink = createServerFn({ method: 'POST' })
   .inputValidator((input) => z.object({ token: z.string().min(16).max(128) }).parse(input))
   .handler(async ({ data }) => {
@@ -75,24 +75,17 @@ export const redeemMagicLink = createServerFn({ method: 'POST' })
     const validated = await validateCustomerMagicToken(data.token);
     const session = await signMagicSession({
       customerNo: validated.customerNo,
-      phone: normalizePhoneSafe(validated.phone),
+      phone: String(validated.phone || '').replace(/\D/g, '').replace(/^972/, '0'),
       name: validated.name,
     });
     return {
       session,
       customerNo: validated.customerNo,
       name: validated.name,
-      phone: normalizePhoneSafe(validated.phone),
+      phone: validated.phone,
     };
   });
 
-function normalizePhoneSafe(v: string) {
-  return String(v || '')
-    .replace(/\D/g, '')
-    .replace(/^972/, '0');
-}
-
-/** Load portal data using magic session token (no Supabase SMS). */
 export const getMyPortalMagic = createServerFn({ method: 'POST' })
   .inputValidator((input) => z.object({ session: z.string().min(20) }).parse(input))
   .handler(async ({ data }) => {
@@ -116,7 +109,6 @@ export const getMyPortalMagic = createServerFn({ method: 'POST' })
     return { customer, orders, documents };
   });
 
-/** Legacy Supabase path (kept for compatibility). */
 export const getMyPortal = createServerFn({ method: 'POST' })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
@@ -138,7 +130,6 @@ export const submitOrder = createServerFn({ method: 'POST' })
     z
       .object({
         order: orderSchema,
-        /** Magic session OR rely on Supabase via separate path */
         session: z.string().optional(),
       })
       .parse(input),
@@ -146,22 +137,13 @@ export const submitOrder = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     setResponseHeader('Cache-Control', 'no-store');
 
-    let customerNo = '';
-    let customerPhone = '';
-    let customerName = '';
-
-    if (data.session) {
-      const payload = await verifyMagicSession(data.session);
-      if (!payload) throw new Error('הסשן פג. יש להיכנס מחדש.');
-      customerNo = payload.customerNo;
-      customerPhone = payload.phone;
-      customerName = payload.name;
-    } else {
-      throw new Error('נדרשת כניסה עם קישור אישי');
-    }
+    if (!data.session) throw new Error('נדרשת כניסה עם קישור אישי');
+    const payload = await verifyMagicSession(data.session);
+    if (!payload) throw new Error('הסשן פג. יש להיכנס מחדש.');
 
     const customer =
-      (await getCustomerByNo(customerNo)) || (await getCustomerByPhone(customerPhone));
+      (await getCustomerByNo(payload.customerNo)) ||
+      (await getCustomerByPhone(payload.phone));
     if (!customer) throw new Error('לקוח לא נמצא');
 
     const catalog = await fetchCatalog();
@@ -179,7 +161,7 @@ export const submitOrder = createServerFn({ method: 'POST' })
 
     const delivery = {
       ...order.delivery,
-      customerName: customer.name || customerName || order.delivery.customerName,
+      customerName: customer.name || payload.name || order.delivery.customerName,
     };
 
     const message = orderMessage(
