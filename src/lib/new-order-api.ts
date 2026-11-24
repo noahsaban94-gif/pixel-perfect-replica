@@ -1,6 +1,5 @@
 /**
  * Server-only client for the NewOrder Apps Script Web App.
- * Handlers: bootstrap, inject, updateCustomerNumber, magic links.
  * Never import this file from client components.
  */
 
@@ -39,10 +38,7 @@ export type AppsScriptProduct = {
   palletCapacity?: number | null;
 };
 
-export type AppsScriptSite = {
-  address?: string;
-  city?: string;
-};
+export type AppsScriptSite = { address?: string; city?: string };
 
 export type AppsScriptCustomer = {
   customerNo?: string;
@@ -105,6 +101,13 @@ type AppsScriptResponse<T = unknown> =
   | { success: true; ok?: true; data?: T; [key: string]: unknown }
   | { success: false; ok?: false; error?: string; message?: string };
 
+/** Digits-only phone for comparison (handles 050-xxx, +972, spaces). */
+function digitsPhone(v: string): string {
+  let d = String(v || '').replace(/\D/g, '');
+  if (d.startsWith('972')) d = '0' + d.slice(3);
+  return d;
+}
+
 async function callAppsScript<T>(
   action: string,
   params: Record<string, unknown> = {},
@@ -112,12 +115,15 @@ async function callAppsScript<T>(
 ): Promise<T> {
   if (!WEBAPP_URL) throw new Error('שרת ההזמנות אינו מוגדר (APPS_SCRIPT_URL חסר)');
 
+  // Always put action+token on the URL. Apps Script POST often 302-redirects and
+  // browsers/runtimes may drop the JSON body on the follow-up request.
   const url = new URL(WEBAPP_URL);
+  url.searchParams.set('action', action);
+  if (API_TOKEN) url.searchParams.set('token', API_TOKEN);
+
   let response: Response;
 
   if (method === 'GET') {
-    url.searchParams.set('action', action);
-    if (API_TOKEN) url.searchParams.set('token', API_TOKEN);
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
     }
@@ -129,19 +135,26 @@ async function callAppsScript<T>(
   } else {
     response = await fetch(url.toString(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
       body: JSON.stringify({ action, token: API_TOKEN || undefined, ...params }),
       redirect: 'follow',
     });
   }
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    console.error('[new-order-api]', action, response.status, body.slice(0, 400));
-    throw new Error(`שרת ההזמנות החזיר שגיאה (${response.status})`);
+  const text = await response.text();
+  let json: AppsScriptResponse<T>;
+  try {
+    json = JSON.parse(text) as AppsScriptResponse<T>;
+  } catch {
+    console.error('[new-order-api]', action, response.status, text.slice(0, 300));
+    throw new Error(
+      `שרת ההזמנות החזיר תשובה לא תקינה (${response.status}). בדוק Deploy של Apps Script.`,
+    );
   }
 
-  const json = (await response.json()) as AppsScriptResponse<T>;
   if (json.success === false || json.ok === false) {
     throw new Error(json.error || json.message || 'הפעולה נכשלה בשרת ההזמנות');
   }
@@ -159,7 +172,7 @@ function mapProduct(raw: AppsScriptProduct): Product | null {
   const deposit = String(raw.deposit ?? '').trim();
   const weight = Number(raw.weightKgPerUnit ?? raw.weight ?? 0) || 0;
   const image = String(raw.imageUrl ?? raw.image ?? '').trim();
-  let keywords = Array.isArray(raw.slangKeywords)
+  const keywords = Array.isArray(raw.slangKeywords)
     ? raw.slangKeywords.join(', ')
     : String(raw.slangKeywords ?? raw.keywords ?? '').trim();
 
@@ -234,7 +247,8 @@ export async function getBootstrap(): Promise<BootstrapData> {
 
 export async function getCustomerByPhone(phone: string): Promise<Customer> {
   const normalized = normalizePhone(phone);
-  if (!normalized) {
+  const dig = digitsPhone(phone);
+  if (!dig) {
     return {
       id: NEW_CUSTOMER_ID,
       name: '',
@@ -245,22 +259,25 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
       linkedIds: [],
     };
   }
+
   try {
     const raw = await callAppsScript<{ customers?: AppsScriptCustomer[] }>('getOrderBootstrapData');
-    const hit = (raw.customers ?? []).filter((c) =>
-      (c.phones ?? []).map((p) => normalizePhone(String(p))).includes(normalized),
-    );
+    const hit = (raw.customers ?? []).filter((c) => {
+      const list = c.phones ?? (c.phone ? [c.phone] : []);
+      return list.some((p) => digitsPhone(String(p)) === dig);
+    });
     if (hit.length > 1) {
       throw new Error('המספר משויך למספר כרטיסים. יש לפנות לסבן לאימות השיוך.');
     }
-    if (hit[0]) return mapCustomer({ ...hit[0], phone: normalized });
+    if (hit[0]) return mapCustomer({ ...hit[0], phone: normalized || dig });
   } catch (e) {
     if (e instanceof Error && e.message.includes('מספר כרטיסים')) throw e;
   }
+
   return {
     id: NEW_CUSTOMER_ID,
     name: '',
-    phone: normalized,
+    phone: normalized || dig,
     sites: [],
     preferredSite: '',
     exempt: false,
@@ -269,11 +286,48 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
 }
 
 export async function getCustomerByNo(customerNo: string): Promise<Customer | null> {
+  const needle = String(customerNo || '').trim();
+  if (!needle) return null;
   const raw = await callAppsScript<{ customers?: AppsScriptCustomer[] }>('getOrderBootstrapData');
-  const hit = (raw.customers ?? []).find(
-    (c) => String(c.customerNo ?? c.comaxPrimaryNo ?? '') === String(customerNo),
-  );
+  const hit = (raw.customers ?? []).find((c) => {
+    const no = String(c.customerNo ?? c.comaxPrimaryNo ?? c.id ?? '').trim();
+    if (no === needle) return true;
+    const linked = [...(c.comaxLinkedIds ?? []), ...(c.linkedIds ?? [])].map(String);
+    return linked.includes(needle);
+  });
   return hit ? mapCustomer(hit) : null;
+}
+
+/** Resolve by phone OR customer number (Comax). */
+export async function resolveCustomer(query: string): Promise<Customer> {
+  const q = String(query || '').trim();
+  if (!q) {
+    return {
+      id: NEW_CUSTOMER_ID,
+      name: '',
+      phone: '',
+      sites: [],
+      preferredSite: '',
+      exempt: false,
+      linkedIds: [],
+    };
+  }
+
+  // Customer numbers are typically 5–7 digits and do not start with 05
+  const dig = digitsPhone(q);
+  if (dig && !dig.startsWith('05') && dig.length >= 4 && dig.length <= 8) {
+    const byNo = await getCustomerByNo(dig);
+    if (byNo) return byNo;
+  }
+
+  if (dig.startsWith('05') || q.includes('-') || q.startsWith('+972')) {
+    return getCustomerByPhone(q);
+  }
+
+  // Try number first then phone
+  const byNo = await getCustomerByNo(q);
+  if (byNo) return byNo;
+  return getCustomerByPhone(q);
 }
 
 export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOrderResult> {
@@ -297,7 +351,7 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
       }));
       mergedItems = JSON.stringify([...a, ...b]);
     } catch {
-      /* keep items */
+      /* keep */
     }
   }
   const body = {
@@ -316,16 +370,30 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
     itemsJson: mergedItems,
     wazeUrl: '',
   };
-  const result = await callAppsScript<InjectOrderResult>('injectNewOrder', body, 'POST');
-  return {
-    orderId: result.orderId ?? payload.orderId ?? '',
-    customerNo: result.customerNo,
-    whatsappMessage: result.whatsappMessage,
-    driveFolderUrl: result.driveFolderUrl,
-    fileUrl: result.fileUrl,
-    wazeUrl: result.wazeUrl,
-    rowNumber: result.rowNumber,
-  };
+  // Prefer GET-style query fallback if POST body is stripped by redirect
+  try {
+    const result = await callAppsScript<InjectOrderResult>('injectNewOrder', body, 'POST');
+    return {
+      orderId: result.orderId ?? payload.orderId ?? '',
+      customerNo: result.customerNo,
+      whatsappMessage: result.whatsappMessage,
+      driveFolderUrl: result.driveFolderUrl,
+      fileUrl: result.fileUrl,
+      wazeUrl: result.wazeUrl,
+      rowNumber: result.rowNumber,
+    };
+  } catch {
+    const result = await callAppsScript<InjectOrderResult>('injectNewOrder', body, 'GET');
+    return {
+      orderId: result.orderId ?? payload.orderId ?? '',
+      customerNo: result.customerNo,
+      whatsappMessage: result.whatsappMessage,
+      driveFolderUrl: result.driveFolderUrl,
+      fileUrl: result.fileUrl,
+      wazeUrl: result.wazeUrl,
+      rowNumber: result.rowNumber,
+    };
+  }
 }
 
 export async function updateOrderCustomerNumber(
@@ -340,10 +408,6 @@ export async function updateOrderCustomerNumber(
   );
 }
 
-/**
- * Issue (or rotate) a per-customer magic link token and persist it on תיקי_לקוחות.
- * Requires Apps Script action: issueCustomerMagicLink
- */
 export async function issueCustomerMagicLink(opts: {
   customerNo?: string;
   phone?: string;
@@ -351,65 +415,97 @@ export async function issueCustomerMagicLink(opts: {
   rotate?: boolean;
 }): Promise<MagicLinkResult> {
   const opaque = generateOpaqueToken();
+  const base = opts.baseUrl.replace(/\/$/, '');
+
+  // Resolve customer first so error messages are clear even if GAS is missing
+  let customer: Customer | null = null;
+  if (opts.customerNo) customer = await getCustomerByNo(opts.customerNo);
+  if (!customer && opts.phone) customer = await getCustomerByPhone(opts.phone);
+  if (!customer || customer.id === NEW_CUSTOMER_ID) {
+    throw new Error(
+      'לא נמצא לקוח רשום. הזן נייד מהכרטיס (למשל 050-5669924) או מספר לקוח (למשל 612108).',
+    );
+  }
+
   try {
-    const result = await callAppsScript<
-      MagicLinkResult & { magicToken?: string }
-    >(
+    const result = await callAppsScript<MagicLinkResult & { magicToken?: string }>(
       'issueCustomerMagicLink',
       {
-        customerNo: opts.customerNo || '',
-        phone: opts.phone || '',
+        customerNo: customer.id,
+        phone: opts.phone || customer.phone || '',
         magicToken: opaque,
         rotate: opts.rotate !== false,
-        baseUrl: opts.baseUrl,
+        baseUrl: base,
       },
       'POST',
     );
     const token = result.magicToken || opaque;
-    const magicUrl =
-      result.magicUrl ||
-      `${opts.baseUrl.replace(/\/$/, '')}/auth/magic?t=${encodeURIComponent(token)}`;
     return {
-      customerNo: result.customerNo,
-      name: result.name,
-      phone: result.phone,
+      customerNo: result.customerNo || customer.id,
+      name: result.name || customer.name,
+      phone: result.phone || customer.phone,
       magicToken: token,
-      magicUrl,
+      magicUrl: result.magicUrl || `${base}/auth/magic?t=${encodeURIComponent(token)}`,
       rowNumber: result.rowNumber,
     };
   } catch (e) {
-    // Fallback when Apps Script handler not deployed yet: resolve customer locally
-    // and return a link that validates via phone+token only after GAS is wired.
     const msg = e instanceof Error ? e.message : '';
-    if (!msg.includes('unknown_action') && !msg.includes('not defined')) throw e;
-
-    let customer: Customer | null = null;
-    if (opts.customerNo) customer = await getCustomerByNo(opts.customerNo);
-    else if (opts.phone) customer = await getCustomerByPhone(opts.phone);
-
-    if (!customer || customer.id === NEW_CUSTOMER_ID) {
-      throw new Error('לא נמצא לקוח קיים. יש ליצור לינק רק ללקוח רשום בתיקי הלקוחות.');
+    if (msg.includes('unknown_action') || msg.includes('not defined')) {
+      throw new Error(
+        'ב-Apps Script חסרים הפעולות issueCustomerMagicLink / validateCustomerMagicToken. הוסף אותן ל-Code.gs + NewOrder.gs ופרסם New version.',
+      );
     }
-
-    throw new Error(
-      'יש להוסיף את handleIssueCustomerMagicLink_ ב-Apps Script (ראה הוראות) כדי לתעד את הטוקן בגיליון.',
-    );
+    // Retry via GET (some deployments strip POST body)
+    try {
+      const result = await callAppsScript<MagicLinkResult & { magicToken?: string }>(
+        'issueCustomerMagicLink',
+        {
+          customerNo: customer.id,
+          phone: opts.phone || customer.phone || '',
+          magicToken: opaque,
+          rotate: String(opts.rotate !== false),
+          baseUrl: base,
+        },
+        'GET',
+      );
+      const token = result.magicToken || opaque;
+      return {
+        customerNo: result.customerNo || customer.id,
+        name: result.name || customer.name,
+        phone: result.phone || customer.phone,
+        magicToken: token,
+        magicUrl: result.magicUrl || `${base}/auth/magic?t=${encodeURIComponent(token)}`,
+        rowNumber: result.rowNumber,
+      };
+    } catch (e2) {
+      const msg2 = e2 instanceof Error ? e2.message : msg;
+      throw new Error(msg2);
+    }
   }
 }
 
-/** Validate opaque magic token from the customer sheet. */
 export async function validateCustomerMagicToken(magicToken: string): Promise<{
   customerNo: string;
   name: string;
   phone: string;
 }> {
-  const result = await callAppsScript<{
-    customerNo: string;
-    name: string;
-    phone: string;
-  }>('validateCustomerMagicToken', { magicToken }, 'POST');
-  if (!result.customerNo) throw new Error('קישור לא תקין או שפג תוקפו');
-  return result;
+  try {
+    const result = await callAppsScript<{
+      customerNo: string;
+      name: string;
+      phone: string;
+    }>('validateCustomerMagicToken', { magicToken }, 'POST');
+    if (!result.customerNo) throw new Error('קישור לא תקין או שפג תוקפו');
+    return result;
+  } catch {
+    const result = await callAppsScript<{
+      customerNo: string;
+      name: string;
+      phone: string;
+    }>('validateCustomerMagicToken', { magicToken }, 'GET');
+    if (!result.customerNo) throw new Error('קישור לא תקין או שפג תוקפו');
+    return result;
+  }
 }
 
 export async function getCustomerOrders(_customerNo: string) {
@@ -442,7 +538,7 @@ export function toThumbnailUrl(imageUrl: string): string {
     const u = new URL(imageUrl);
     if (u.hostname === 'drive.google.com' || u.hostname === 'docs.google.com') {
       const fileId =
-        u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1] ?? u.searchParams.get('id');
+        u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1]?[1] ?? u.searchParams.get('id');
       if (fileId) return `https://drive.google.com/thumbnail?id=${fileId}&sz=w600`;
     }
     return imageUrl;
