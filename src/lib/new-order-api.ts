@@ -7,14 +7,19 @@
 import type { Customer, Product } from './portal-domain';
 import { isCustomerProduct, NEW_CUSTOMER_ID, normalizePhone } from './portal-domain';
 
+/** Latest verified deployment (2026-11-24) */
+const DEFAULT_WEBAPP_URL =
+  'https://script.google.com/macros/s/AKfycbzR9gPq73D75pVxAkqEwM0Kx-eYlxIGBk39LhwtAXilY89lPfyQO0izd2aL7PtbkCSfdQ/exec';
+
 const WEBAPP_URL =
   process.env['APPS_SCRIPT_URL'] ??
   process.env['NEW_ORDER_WEBAPP_URL'] ??
-  '';
+  DEFAULT_WEBAPP_URL;
+
 const API_TOKEN = process.env['API_TOKEN'] ?? '';
 
-if (!WEBAPP_URL && process.env.NODE_ENV === 'production') {
-  console.error('[new-order-api] APPS_SCRIPT_URL / NEW_ORDER_WEBAPP_URL is not set');
+if (!API_TOKEN && process.env.NODE_ENV === 'production') {
+  console.error('[new-order-api] API_TOKEN is not set – protected actions will fail');
 }
 
 // ---------------------------------------------------------------------------
