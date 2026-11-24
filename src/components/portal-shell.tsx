@@ -24,7 +24,6 @@ import { registerPortalWorker } from '@/lib/pwa';
 import { requestMagicLink } from '@/lib/portal.functions';
 import { useServerFn } from '@tanstack/react-start';
 import { toast } from 'sonner';
-import brand from '@/assets/saban-brand.jpg.asset.json';
 
 const nav = [
   { to: '/', label: 'הזמנה חדשה', Icon: Plus },
@@ -153,7 +152,7 @@ function AuthDialog() {
     <Dialog open={p.authOpen} onOpenChange={p.setAuthOpen}>
       <DialogContent dir="rtl">
         <img
-          src={brand.url}
+          src="/brand/saban-mark.svg"
           alt="ח. סבן חומרי בניין (1994) בע״מ"
           className="brand-dialog"
         />
