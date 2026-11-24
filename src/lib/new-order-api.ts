@@ -538,7 +538,7 @@ export function toThumbnailUrl(imageUrl: string): string {
     const u = new URL(imageUrl);
     if (u.hostname === 'drive.google.com' || u.hostname === 'docs.google.com') {
       const fileId =
-        u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1]?[1] ?? u.searchParams.get('id');
+        u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1] ?? u.searchParams.get('id');
       if (fileId) return `https://drive.google.com/thumbnail?id=${fileId}&sz=w600`;
     }
     return imageUrl;
