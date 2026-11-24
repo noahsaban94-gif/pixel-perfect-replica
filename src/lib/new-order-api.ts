@@ -8,7 +8,7 @@ import { isCustomerProduct, NEW_CUSTOMER_ID, normalizePhone } from './portal-dom
 import { generateOpaqueToken } from './magic-session';
 
 const DEFAULT_WEBAPP_URL =
-  'https://script.google.com/macros/s/AKfycbz3H6sNSxcBfuIhervXRM0V6mkjrp1VoJQ1azdrPL-JUffEf3_2uCudybRDHblFxDZo4w/exec';
+  'https://script.google.com/macros/s/AKfycbxIG20m2ikq3UIPVEic0PvwgH2f2oEdw7OlyFX7xyQuKMf_Jo55AW3fd9cq75T-ks3vuw/exec';
 
 const WEBAPP_URL =
   process.env['APPS_SCRIPT_URL'] ??
@@ -535,28 +535,124 @@ export async function validateCustomerMagicToken(magicToken: string): Promise<{
   }
 }
 
-export async function getCustomerOrders(_customerNo: string) {
-  return [] as {
-    id: string;
-    date: string;
-    address: string;
-    status: string;
-    project: string;
-    products: string;
-    weight: string;
-    lines: { sku: string; quantity: number }[];
-  }[];
+async function getCustomerIdSet(customerNo: string): Promise<Set<string>> {
+  const clean = String(customerNo || '').trim();
+  const ids = new Set<string>(clean ? [clean] : []);
+  if (!clean) return ids;
+  try {
+    const cust = await getCustomerByNo(clean);
+    if (cust) {
+      if (cust.id) ids.add(String(cust.id).trim());
+      for (const l of cust.linkedIds ?? []) {
+        if (l) ids.add(String(l).trim());
+      }
+    }
+  } catch {
+    // keep primary id only
+  }
+  return ids;
 }
 
-export async function getCustomerDocuments(_customerNo: string) {
-  return [] as {
+export async function getCustomerOrders(customerNo: string) {
+  const idSet = await getCustomerIdSet(customerNo);
+  if (idSet.size === 0) return [];
+
+  try {
+    const raw = await callAppsScript<{ orders?: Record<string, unknown>[] }>('getOrders');
+    const orders = raw.orders ?? [];
+    return orders
+      .filter((o) => idSet.has(String(o.customerNo ?? '').trim()))
+      .map((o) => {
+        const itemsText = String(o.itemsText ?? o.items ?? '');
+        let lines: { sku: string; quantity: number }[] = [];
+        try {
+          if (itemsText.trim().startsWith('[')) {
+            const parsed = JSON.parse(itemsText) as { sku?: string; qty?: number; quantity?: number }[];
+            lines = parsed
+              .filter((x) => x.sku)
+              .map((x) => ({ sku: String(x.sku), quantity: Number(x.qty ?? x.quantity ?? 1) || 1 }));
+          }
+        } catch {
+          /* plain text items */
+        }
+        return {
+          id: String(o.id ?? ''),
+          date: String(o.deliveryDate ?? o.receivedDate ?? o.date ?? ''),
+          address: String(o.address ?? ''),
+          status: String(o.status ?? 'בהכנה'),
+          project: String(o.customer ?? ''),
+          products: itemsText,
+          weight: String(o.weightTons ?? o.weight ?? ''),
+          lines,
+        };
+      });
+  } catch {
+    return [];
+  }
+}
+
+export async function getCustomerDocuments(customerNo: string) {
+  const idSet = await getCustomerIdSet(customerNo);
+  if (idSet.size === 0) return [];
+
+  const docs: {
     id: string;
     date: string;
     address: string;
     status: string;
     url: string;
     name: string;
-  }[];
+  }[] = [];
+
+  try {
+    const raw = await callAppsScript<{ notes?: Record<string, unknown>[] }>('getNotes');
+    for (const n of raw.notes ?? []) {
+      const cNo = String(n.customerNo ?? '').trim();
+      if (!idSet.has(cNo)) continue;
+      const fileId = String(n.fileId ?? '').trim();
+      const url =
+        String(n.signedUrl ?? '').trim() ||
+        String(n.driveUrl ?? '').trim() ||
+        (fileId ? `https://drive.google.com/file/d/${fileId}/view` : '');
+      const docNum = String(n.docNumber ?? n.id ?? '').trim();
+      docs.push({
+        id: docNum,
+        date: String(n.date ?? ''),
+        address: String(n.address ?? ''),
+        status: String(n.approvalStatus ?? n.extractStatus ?? 'סופק'),
+        url,
+        name: `תעודת משלוח ${docNum}`,
+      });
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // גם מסמכים מארכיון_מסמכי_לקוחות
+  for (const cid of idSet) {
+    try {
+      const res = await callAppsScript<{ documents?: Record<string, unknown>[] }>(
+        'getCustomerDocuments',
+        { customerNo: cid },
+      );
+      for (const d of res.documents ?? []) {
+        const url = String(d.driveUrl ?? '').trim();
+        if (!url) continue;
+        docs.push({
+          id: String(d.fileId ?? d.fileName ?? ''),
+          date: String(d.uploadedAt ?? '').slice(0, 10),
+          address: String(d.folderName ?? ''),
+          status: String(d.status ?? d.docTypeLabel ?? 'מסמך'),
+          url,
+          name: String(d.fileName ?? d.originalFileName ?? 'מסמך לקוח'),
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return docs;
 }
 
 export function toThumbnailUrl(imageUrl: string): string {
