@@ -78,30 +78,23 @@ function ErrorComponent({ error, reset }: ErrorComponentProps) {
 
 export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
   head: () => ({
-    // Replace these placeholders with the app's name and description when first building the app.
-    // Each content route, / included, must still set its own head(). Never add og:image or
-    // twitter:image here: every page without its own would inherit the root's preview image.
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "ח. סבן | פורטל לקוחות" },
       { name: "description", content: "פורטל הלקוחות של ח. סבן חומרי בניין: הזמנות, אספקה ותעודות משלוח." },
-      { name: "author", content: "Lovable" },
+      { name: "author", content: "ח. סבן" },
       { property: "og:title", content: "ח. סבן | פורטל לקוחות" },
       { property: "og:description", content: "הזמנת חומרי בניין וצפייה במסמכי האספקה שלך." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:site", content: "@Lovable" },
     ],
     links: [
-      {
-        rel: "stylesheet",
-        href: appCss,
-      },
-      { rel: "icon", href: "/favicon.ico", type: "image/x-icon" },
+      { rel: "stylesheet", href: appCss },
+      { rel: "icon", href: "/icons/icon.svg", type: "image/svg+xml" },
       { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700;800;900&display=swap' },
       { rel: 'manifest', href: '/manifest.webmanifest' },
-      { rel: 'apple-touch-icon', href: '/icons/icon-192.png' },
+      { rel: 'apple-touch-icon', href: '/icons/icon.svg' },
     ],
   }),
   shellComponent: RootShell,
@@ -129,7 +122,6 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
       <PortalProvider><PortalShell><Outlet /></PortalShell></PortalProvider>
       <Toaster dir="rtl" position="top-center" />
     </QueryClientProvider>
