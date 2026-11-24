@@ -1,6 +1,9 @@
 /**
  * Server-only client for the NewOrder Apps Script Web App.
- * All calls to Google Sheets / Drive go through this module.
+ * Aligned with NewOrder.gs handlers:
+ *   handleGetOrderBootstrapData_
+ *   handleInjectNewOrder_
+ *   handleUpdateOrderCustomerNumber_
  * Never import this file from client components.
  */
 
@@ -23,7 +26,7 @@ if (!API_TOKEN && process.env.NODE_ENV === 'production') {
 }
 
 // ---------------------------------------------------------------------------
-// Types returned by the Apps Script (subset we actually consume)
+// Types returned by NewOrder.gs (subset we consume)
 // ---------------------------------------------------------------------------
 
 export type AppsScriptProduct = {
@@ -32,28 +35,47 @@ export type AppsScriptProduct = {
   name?: string;
   unit?: string;
   category?: string;
-  slangKeywords?: string;
+  slangKeywords?: string | string[];
   keywords?: string;
-  deposit?: string; // "60002" | "60060" | "60006" | ""
+  deposit?: string;
   weightKgPerUnit?: number;
   weight?: number;
   imageUrl?: string;
   image?: string;
   technical?: string;
   palletCapacity?: number | null;
+  defaultWarehouse?: string;
+  recommendedDriver?: string;
+  mediaCode?: string;
+};
+
+export type AppsScriptSite = {
+  address?: string;
+  city?: string;
+  p80StayMin?: number | null;
+  roadKmFromHarash?: number | null;
+  roadKmFromTalmid?: number | null;
+  defaultUnloadType?: string;
 };
 
 export type AppsScriptCustomer = {
   customerNo?: string;
   id?: string;
   name?: string;
+  aliases?: string[];
   phones?: string[];
   phone?: string;
-  sites?: string[];
-  preferredSite?: string;
+  contactName?: string;
+  defaultSiteAddress?: string;
+  typicalUnloadType?: string;
+  recommendedTruck?: string;
+  masterId?: string;
   comaxPrimaryNo?: string;
   comaxLinkedIds?: string[];
   linkedIds?: string[];
+  driveFolderUrl?: string;
+  sites?: (string | AppsScriptSite)[];
+  preferredSite?: string;
   isPendingComax?: boolean;
   exempt?: boolean;
 };
@@ -63,8 +85,9 @@ export type BootstrapData = {
   products: Product[];
 };
 
+/** Portal-side payload (mapped to Apps Script shape in injectOrder) */
 export type InjectOrderPayload = {
-  orderId: string;
+  orderId?: string;
   customerNo: string;
   customerName: string;
   contactName: string;
@@ -73,17 +96,22 @@ export type InjectOrderPayload = {
   deliveryDate: string;
   project?: string;
   notes?: string;
-  lines: { sku: string; name: string; quantity: number }[];
-  totalWeightKg: number;
-  deposits: { sku: string; name: string; quantity: number }[];
-  whatsappMessage: string;
+  warehouse?: string;
+  driver?: string;
+  lines: { sku: string; name: string; quantity: number; unit?: string }[];
+  totalWeightKg?: number;
+  deposits?: { sku: string; name: string; quantity: number }[];
+  whatsappMessage?: string;
 };
 
 export type InjectOrderResult = {
   orderId: string;
+  customerNo?: string;
   whatsappMessage?: string;
   driveFolderUrl?: string;
+  fileUrl?: string;
   wazeUrl?: string;
+  rowNumber?: number;
 };
 
 type AppsScriptResponse<T = unknown> =
@@ -104,7 +132,6 @@ async function callAppsScript<T>(
   }
 
   const url = new URL(WEBAPP_URL);
-
   let response: Response;
 
   if (method === 'GET') {
@@ -142,27 +169,19 @@ async function callAppsScript<T>(
 
   const json = (await response.json()) as AppsScriptResponse<T>;
 
-  // Support both { success: true, data } and { ok: true, ...fields }
   if (json.success === false || json.ok === false) {
     throw new Error(json.error || json.message || 'הפעולה נכשלה בשרת ההזמנות');
   }
 
-  // Prefer explicit data field; otherwise return the whole payload (minus meta)
   if ('data' in json && json.data !== undefined) return json.data as T;
   const { success: _s, ok: _o, error: _e, message: _m, ...rest } = json as Record<string, unknown>;
   return rest as T;
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Mappers
 // ---------------------------------------------------------------------------
 
-/** Health check */
-export async function ping(): Promise<{ version?: string }> {
-  return callAppsScript('ping');
-}
-
-/** Map raw Apps Script product → safe Product DTO */
 function mapProduct(raw: AppsScriptProduct): Product | null {
   const sku = String(raw.sku ?? '').trim();
   const name = String(raw.officialName ?? raw.name ?? '').trim();
@@ -172,9 +191,16 @@ function mapProduct(raw: AppsScriptProduct): Product | null {
   const deposit = String(raw.deposit ?? '').trim();
   const weight = Number(raw.weightKgPerUnit ?? raw.weight ?? 0) || 0;
   const image = String(raw.imageUrl ?? raw.image ?? '').trim();
-  const keywords = String(raw.slangKeywords ?? raw.keywords ?? '').trim();
+
+  let keywords = '';
+  if (Array.isArray(raw.slangKeywords)) {
+    keywords = raw.slangKeywords.join(', ');
+  } else {
+    keywords = String(raw.slangKeywords ?? raw.keywords ?? '').trim();
+  }
+
   const technical = String(raw.technical ?? '').trim();
-  const unit = String(raw.unit ?? 'יח\'').trim();
+  const unit = String(raw.unit ?? "יח'").trim();
   const category = String(raw.category ?? 'כללי').trim();
 
   let palletCapacity: number | null = raw.palletCapacity ?? null;
@@ -197,15 +223,12 @@ function mapProduct(raw: AppsScriptProduct): Product | null {
   };
 }
 
-/** Map raw Apps Script customer → safe Customer DTO */
 function mapCustomer(raw: AppsScriptCustomer): Customer {
   const id =
     String(raw.comaxPrimaryNo ?? raw.customerNo ?? raw.id ?? NEW_CUSTOMER_ID).trim() ||
     NEW_CUSTOMER_ID;
-  const linkedIds = [
-    ...(raw.comaxLinkedIds ?? []),
-    ...(raw.linkedIds ?? []),
-  ]
+
+  const linkedIds = [...(raw.comaxLinkedIds ?? []), ...(raw.linkedIds ?? [])]
     .map((v) => String(v).trim())
     .filter(Boolean);
 
@@ -213,47 +236,56 @@ function mapCustomer(raw: AppsScriptCustomer): Customer {
     .map((p) => normalizePhone(String(p)))
     .filter(Boolean);
 
+  // sites can be string[] or object[] with .address
+  const sites = (raw.sites ?? [])
+    .map((s) => {
+      if (typeof s === 'string') return s.trim();
+      if (s && typeof s === 'object' && s.address) return String(s.address).trim();
+      return '';
+    })
+    .filter(Boolean);
+
+  const preferred =
+    String(raw.preferredSite ?? raw.defaultSiteAddress ?? '').trim() || sites[0] || '';
+
   return {
     id,
     name: String(raw.name ?? '').trim(),
     phone: phones[0] ?? '',
-    sites: (raw.sites ?? []).map((s) => String(s).trim()).filter(Boolean),
-    preferredSite: String(raw.preferredSite ?? '').trim(),
+    sites,
+    preferredSite: preferred,
     exempt: Boolean(raw.exempt),
     linkedIds,
   };
 }
 
-// Short in-memory cache for catalog (Stale-While-Revalidate style)
-let catalogCache: { expires: number; products: Product[] } | null = null;
-const CATALOG_TTL_MS = 5 * 60 * 1000; // 5 minutes (matches Apps Script cache)
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
-/** Fetch + filter catalog. Safe for public use. */
+let catalogCache: { expires: number; products: Product[] } | null = null;
+const CATALOG_TTL_MS = 5 * 60 * 1000;
+
+export async function ping(): Promise<{ version?: string }> {
+  return callAppsScript('ping');
+}
+
+/**
+ * Catalog = products from handleGetOrderBootstrapData_.
+ * There is no separate getCatalog_ in NewOrder.gs.
+ */
 export async function getCatalog(): Promise<Product[]> {
   if (catalogCache && catalogCache.expires > Date.now()) {
     return catalogCache.products;
   }
 
-  // Prefer dedicated getCatalog; fall back to bootstrap if needed
-  let rawProducts: AppsScriptProduct[] = [];
-  try {
-    const result = await callAppsScript<{ products?: AppsScriptProduct[] } | AppsScriptProduct[]>(
-      'getCatalog',
-    );
-    rawProducts = Array.isArray(result) ? result : (result.products ?? []);
-  } catch {
-    const bootstrap = await callAppsScript<{
-      products?: AppsScriptProduct[];
-    }>('getOrderBootstrapData');
-    rawProducts = bootstrap.products ?? [];
-  }
-
-  const products = rawProducts.map(mapProduct).filter((p): p is Product => p !== null);
+  const raw = await callAppsScript<{ products?: AppsScriptProduct[] }>('getOrderBootstrapData');
+  const products = (raw.products ?? []).map(mapProduct).filter((p): p is Product => p !== null);
   catalogCache = { expires: Date.now() + CATALOG_TTL_MS, products };
   return products;
 }
 
-/** Full bootstrap (customers + products). Used for order wizard. */
+/** Full bootstrap (customers + products) via handleGetOrderBootstrapData_ */
 export async function getBootstrap(): Promise<BootstrapData> {
   const raw = await callAppsScript<{
     customers?: AppsScriptCustomer[];
@@ -263,13 +295,11 @@ export async function getBootstrap(): Promise<BootstrapData> {
   const products = (raw.products ?? []).map(mapProduct).filter((p): p is Product => p !== null);
   const customers = (raw.customers ?? []).map(mapCustomer);
 
-  // Keep catalog cache warm
   catalogCache = { expires: Date.now() + CATALOG_TTL_MS, products };
-
   return { customers, products };
 }
 
-/** Find customer by normalized phone. Returns new-customer stub if not found. */
+/** Resolve customer by phone using bootstrap data (no separate getCustomer_ yet). */
 export async function getCustomerByPhone(phone: string): Promise<Customer> {
   const normalized = normalizePhone(phone);
   if (!normalized) {
@@ -285,33 +315,27 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
   }
 
   try {
-    // Prefer dedicated endpoint if available
-    const result = await callAppsScript<
-      AppsScriptCustomer | { customer?: AppsScriptCustomer }
-    >('getCustomer', { phone: normalized });
-    const raw = 'customer' in result && result.customer ? result.customer : (result as AppsScriptCustomer);
-    if (raw && (raw.customerNo || raw.comaxPrimaryNo || raw.id || raw.name)) {
-      return mapCustomer({ ...raw, phone: normalized });
-    }
-  } catch {
-    // fall through to search / bootstrap
-  }
+    const { customers } = await getBootstrap();
+    const matches = customers.filter((c) => {
+      // bootstrap already normalized one primary phone; also check linked via raw if needed
+      return c.phone === normalized;
+    });
 
-  // Fallback: searchCustomers or bootstrap scan
-  try {
-    const search = await callAppsScript<
-      AppsScriptCustomer[] | { customers?: AppsScriptCustomer[] }
-    >('searchCustomers', { q: normalized });
-    const list = Array.isArray(search) ? search : (search.customers ?? []);
-    const matches = list.filter((c) =>
-      (c.phones ?? (c.phone ? [c.phone] : []))
-        .map((p) => normalizePhone(String(p)))
-        .includes(normalized),
-    );
-    if (matches.length > 1) {
+    // Also scan all phones from a fresh bootstrap if primary didn't match
+    if (!matches.length) {
+      const raw = await callAppsScript<{ customers?: AppsScriptCustomer[] }>('getOrderBootstrapData');
+      const hit = (raw.customers ?? []).filter((c) =>
+        (c.phones ?? []).map((p) => normalizePhone(String(p))).includes(normalized),
+      );
+      if (hit.length > 1) {
+        throw new Error('המספר משויך למספר כרטיסים. יש לפנות לסבן לאימות השיוך.');
+      }
+      if (hit[0]) return mapCustomer({ ...hit[0], phone: normalized });
+    } else if (matches.length > 1) {
       throw new Error('המספר משויך למספר כרטיסים. יש לפנות לסבן לאימות השיוך.');
+    } else if (matches[0]) {
+      return { ...matches[0], phone: normalized };
     }
-    if (matches[0]) return mapCustomer({ ...matches[0], phone: normalized });
   } catch (e) {
     if (e instanceof Error && e.message.includes('מספר כרטיסים')) throw e;
   }
@@ -327,84 +351,124 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
   };
 }
 
-/** Inject a new order via Apps Script (creates Drive folder + returns WhatsApp text). */
+/**
+ * Inject order → handleInjectNewOrder_
+ * Body shape expected by NewOrder.gs:
+ *   customerNo, customerName, address, itemsJson (string),
+ *   contactPhone, contactName, deliveryDate, notes, warehouse, driver, wazeUrl
+ */
 export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOrderResult> {
-  const result = await callAppsScript<InjectOrderResult>('injectNewOrder', payload as unknown as Record<string, unknown>, 'POST');
+  const itemsJson = JSON.stringify(
+    payload.lines.map((l) => ({
+      sku: l.sku,
+      name: l.name,
+      qty: l.quantity,
+      unit: l.unit || "יח'",
+    })),
+  );
+
+  // Include deposit lines in items if present
+  const depositsJson =
+    payload.deposits && payload.deposits.length
+      ? JSON.stringify(
+          payload.deposits.map((d) => ({
+            sku: d.sku,
+            name: d.name,
+            qty: d.quantity,
+            unit: "יח'",
+          })),
+        )
+      : null;
+
+  let mergedItems = itemsJson;
+  if (depositsJson) {
+    try {
+      const a = JSON.parse(itemsJson);
+      const b = JSON.parse(depositsJson);
+      mergedItems = JSON.stringify([...a, ...b]);
+    } catch {
+      /* keep items only */
+    }
+  }
+
+  const body = {
+    customerNo: payload.customerNo,
+    customerName: payload.customerName,
+    address: payload.deliveryAddress,
+    contactPhone: payload.contactPhone,
+    contactName: payload.contactName,
+    phone: payload.contactPhone,
+    deliveryDate: payload.deliveryDate,
+    deliveryWindow: '',
+    notes: [payload.project ? `פרויקט: ${payload.project}` : '', payload.notes || '']
+      .filter(Boolean)
+      .join('\n'),
+    warehouse: payload.warehouse || '',
+    driver: payload.driver || '',
+    itemsJson: mergedItems,
+    wazeUrl: '',
+  };
+
+  const result = await callAppsScript<InjectOrderResult>('injectNewOrder', body, 'POST');
+
   return {
-    orderId: result.orderId ?? payload.orderId,
+    orderId: result.orderId ?? payload.orderId ?? '',
+    customerNo: result.customerNo,
     whatsappMessage: result.whatsappMessage,
     driveFolderUrl: result.driveFolderUrl,
+    fileUrl: result.fileUrl,
     wazeUrl: result.wazeUrl,
+    rowNumber: result.rowNumber,
   };
 }
 
-/** Update customer number on an existing order (e.g. 500500 → real Comax). */
+/** Update customer number → handleUpdateOrderCustomerNumber_ */
 export async function updateOrderCustomerNumber(
   orderId: string,
-  customerNo: string,
+  newCustomerNo: string,
+  oldCustomerNo?: string,
 ): Promise<void> {
-  await callAppsScript('updateOrderCustomerNumber', { orderId, customerNo }, 'POST');
+  await callAppsScript(
+    'updateOrderCustomerNumber',
+    {
+      orderId,
+      newCustomerNo,
+      oldCustomerNo: oldCustomerNo || '',
+    },
+    'POST',
+  );
 }
 
-/** Customer orders (server-side filtered by customer number). */
-export async function getCustomerOrders(customerNo: string): Promise<
-  { id: string; date: string; address: string; status: string; project: string; products: string; weight: string; lines: { sku: string; quantity: number }[] }[]
+/** Orders history – not yet in NewOrder.gs; returns empty until wired */
+export async function getCustomerOrders(_customerNo: string): Promise<
+  {
+    id: string;
+    date: string;
+    address: string;
+    status: string;
+    project: string;
+    products: string;
+    weight: string;
+    lines: { sku: string; quantity: number }[];
+  }[]
 > {
-  if (!customerNo || customerNo === NEW_CUSTOMER_ID) return [];
-  try {
-    const result = await callAppsScript<
-      | { orders?: unknown[] }
-      | unknown[]
-    >('getCustomerHistory', { customerNo });
-    const list = Array.isArray(result) ? result : (result.orders ?? []);
-    return list.map((raw: any) => ({
-      id: String(raw.id ?? raw.orderId ?? ''),
-      date: String(raw.date ?? raw.deliveryDate ?? ''),
-      address: String(raw.address ?? raw.deliveryAddress ?? ''),
-      status: String(raw.status ?? 'ממתינה לאישור'),
-      project: String(raw.project ?? ''),
-      products: String(raw.products ?? ''),
-      weight: String(raw.weight ?? raw.totalWeightKg ?? ''),
-      lines: Array.isArray(raw.lines) ? raw.lines : [],
-    }));
-  } catch {
-    return [];
-  }
+  return [];
 }
 
-/** Customer delivery notes / documents. */
-export async function getCustomerDocuments(customerNo: string): Promise<
+/** Documents – not yet in NewOrder.gs; returns empty until wired */
+export async function getCustomerDocuments(_customerNo: string): Promise<
   { id: string; date: string; address: string; status: string; url: string; name: string }[]
 > {
-  if (!customerNo || customerNo === NEW_CUSTOMER_ID) return [];
-  try {
-    const result = await callAppsScript<
-      | { documents?: unknown[]; notes?: unknown[] }
-      | unknown[]
-    >('getCustomerDocuments', { customerNo });
-    const list = Array.isArray(result)
-      ? result
-      : [...(result.documents ?? []), ...(result.notes ?? [])];
-    return list.map((raw: any) => ({
-      id: String(raw.id ?? ''),
-      date: String(raw.date ?? ''),
-      address: String(raw.address ?? ''),
-      status: String(raw.status ?? ''),
-      url: String(raw.url ?? raw.fileUrl ?? ''),
-      name: String(raw.name ?? raw.title ?? 'מסמך'),
-    }));
-  } catch {
-    return [];
-  }
+  return [];
 }
 
-/** Convert Drive file URL to a safe thumbnail URL (or leave as-is for proxy). */
 export function toThumbnailUrl(imageUrl: string): string {
   if (!imageUrl) return '';
   try {
     const u = new URL(imageUrl);
     if (u.hostname === 'drive.google.com' || u.hostname === 'docs.google.com') {
-      const fileId = u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1] ?? u.searchParams.get('id');
+      const fileId =
+        u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1] ?? u.searchParams.get('id');
       if (fileId) return `https://drive.google.com/thumbnail?id=${fileId}&sz=w600`;
     }
     return imageUrl;
