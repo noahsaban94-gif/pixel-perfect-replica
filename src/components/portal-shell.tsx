@@ -19,7 +19,6 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { usePortal } from './portal-context';
-import { phoneSchema } from '@/lib/portal-domain';
 import { registerPortalWorker } from '@/lib/pwa';
 import { requestMagicLink } from '@/lib/portal.functions';
 import { useServerFn } from '@tanstack/react-start';
@@ -109,7 +108,7 @@ export function PortalShell({ children }: { children: ReactNode }) {
 
 function AuthDialog() {
   const p = usePortal();
-  const [phone, setPhone] = useState('');
+  const [query, setQuery] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [magicUrl, setMagicUrl] = useState('');
@@ -119,15 +118,15 @@ function AuthDialog() {
   async function submit() {
     setError('');
     setMagicUrl('');
-    const result = phoneSchema.safeParse(phone);
-    if (!result.success) {
-      setError('יש להזין מספר נייד תקין');
+    const q = query.trim();
+    if (q.length < 4) {
+      setError('הזן נייד (050…) או מספר לקוח (למשל 612108)');
       return;
     }
     setBusy(true);
     try {
       const baseUrl = window.location.origin;
-      const res = await requestLink({ data: { phone: result.data, baseUrl } });
+      const res = await requestLink({ data: { query: q, baseUrl } });
       setMagicUrl(res.magicUrl);
       setCustomerName(res.name || '');
       toast.success('נוצר קישור אישי ללקוח');
@@ -162,7 +161,7 @@ function AuthDialog() {
         <DialogDescription className="text-right">
           {p.signedIn
             ? 'ניהול החשבון האישי שלך'
-            : 'הזן נייד רשום – ייווצר קישור חד־פעמי שמתועד בתיק הלקוח'}
+            : 'הזן נייד או מספר לקוח מהכרטיס – ייווצר קישור שמתועד בתיק הלקוח'}
         </DialogDescription>
 
         {p.signedIn ? (
@@ -188,17 +187,17 @@ function AuthDialog() {
           </>
         ) : (
           <>
-            <label className="field-label" htmlFor="login-phone">
-              מספר הטלפון בכרטיס הלקוח
+            <label className="field-label" htmlFor="login-query">
+              נייד או מספר לקוח
             </label>
             <Input
-              id="login-phone"
-              type="tel"
+              id="login-query"
+              type="text"
               dir="ltr"
-              maxLength={16}
-              placeholder="050-000-0000"
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
+              maxLength={20}
+              placeholder="050-5669924 או 612108"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
             />
             <Button onClick={submit} disabled={busy}>
               {busy ? <LoaderCircle className="animate-spin" /> : <Link2 />}
@@ -228,8 +227,7 @@ function AuthDialog() {
                   </Button>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  הטוקן נשמר בעמודת לינק/טוקן בגיליון תיקי הלקוחות. הלקוח לוחץ על הקישור
-                  ונכנס ישירות.
+                  הטוקן נשמר בעמודת magic_token בגיליון תיקי הלקוחות.
                 </p>
               </div>
             ) : null}
