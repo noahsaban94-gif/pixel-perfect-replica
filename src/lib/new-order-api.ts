@@ -10,9 +10,9 @@
 import type { Customer, Product } from './portal-domain';
 import { isCustomerProduct, NEW_CUSTOMER_ID, normalizePhone } from './portal-domain';
 
-/** Latest verified deployment (2026-11-24) */
+/** Working deployment verified 2026-11-24 – 59 customers, 2489 products */
 const DEFAULT_WEBAPP_URL =
-  'https://script.google.com/macros/s/AKfycbzR9gPq73D75pVxAkqEwM0Kx-eYlxIGBk39LhwtAXilY89lPfyQO0izd2aL7PtbkCSfdQ/exec';
+  'https://script.google.com/macros/s/AKfycbxIG20m2ikq3UIPVEic0PvwgH2f2oEdw7OlyFX7xyQuKMf_Jo55AW3fd9cq75T-ks3vuw/exec';
 
 const WEBAPP_URL =
   process.env['APPS_SCRIPT_URL'] ??
@@ -236,7 +236,6 @@ function mapCustomer(raw: AppsScriptCustomer): Customer {
     .map((p) => normalizePhone(String(p)))
     .filter(Boolean);
 
-  // sites can be string[] or object[] with .address
   const sites = (raw.sites ?? [])
     .map((s) => {
       if (typeof s === 'string') return s.trim();
@@ -272,7 +271,7 @@ export async function ping(): Promise<{ version?: string }> {
 
 /**
  * Catalog = products from handleGetOrderBootstrapData_.
- * There is no separate getCatalog_ in NewOrder.gs.
+ * getCatalog is an alias that returns the same bootstrap payload.
  */
 export async function getCatalog(): Promise<Product[]> {
   if (catalogCache && catalogCache.expires > Date.now()) {
@@ -299,7 +298,7 @@ export async function getBootstrap(): Promise<BootstrapData> {
   return { customers, products };
 }
 
-/** Resolve customer by phone using bootstrap data (no separate getCustomer_ yet). */
+/** Resolve customer by phone using bootstrap data. */
 export async function getCustomerByPhone(phone: string): Promise<Customer> {
   const normalized = normalizePhone(phone);
   if (!normalized) {
@@ -315,27 +314,14 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
   }
 
   try {
-    const { customers } = await getBootstrap();
-    const matches = customers.filter((c) => {
-      // bootstrap already normalized one primary phone; also check linked via raw if needed
-      return c.phone === normalized;
-    });
-
-    // Also scan all phones from a fresh bootstrap if primary didn't match
-    if (!matches.length) {
-      const raw = await callAppsScript<{ customers?: AppsScriptCustomer[] }>('getOrderBootstrapData');
-      const hit = (raw.customers ?? []).filter((c) =>
-        (c.phones ?? []).map((p) => normalizePhone(String(p))).includes(normalized),
-      );
-      if (hit.length > 1) {
-        throw new Error('המספר משויך למספר כרטיסים. יש לפנות לסבן לאימות השיוך.');
-      }
-      if (hit[0]) return mapCustomer({ ...hit[0], phone: normalized });
-    } else if (matches.length > 1) {
+    const raw = await callAppsScript<{ customers?: AppsScriptCustomer[] }>('getOrderBootstrapData');
+    const hit = (raw.customers ?? []).filter((c) =>
+      (c.phones ?? []).map((p) => normalizePhone(String(p))).includes(normalized),
+    );
+    if (hit.length > 1) {
       throw new Error('המספר משויך למספר כרטיסים. יש לפנות לסבן לאימות השיוך.');
-    } else if (matches[0]) {
-      return { ...matches[0], phone: normalized };
     }
+    if (hit[0]) return mapCustomer({ ...hit[0], phone: normalized });
   } catch (e) {
     if (e instanceof Error && e.message.includes('מספר כרטיסים')) throw e;
   }
@@ -353,9 +339,7 @@ export async function getCustomerByPhone(phone: string): Promise<Customer> {
 
 /**
  * Inject order → handleInjectNewOrder_
- * Body shape expected by NewOrder.gs:
- *   customerNo, customerName, address, itemsJson (string),
- *   contactPhone, contactName, deliveryDate, notes, warehouse, driver, wazeUrl
+ * Body: customerNo, customerName, address, itemsJson, contactPhone, contactName, deliveryDate, notes
  */
 export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOrderResult> {
   const itemsJson = JSON.stringify(
@@ -367,24 +351,16 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
     })),
   );
 
-  // Include deposit lines in items if present
-  const depositsJson =
-    payload.deposits && payload.deposits.length
-      ? JSON.stringify(
-          payload.deposits.map((d) => ({
-            sku: d.sku,
-            name: d.name,
-            qty: d.quantity,
-            unit: "יח'",
-          })),
-        )
-      : null;
-
   let mergedItems = itemsJson;
-  if (depositsJson) {
+  if (payload.deposits && payload.deposits.length) {
     try {
       const a = JSON.parse(itemsJson);
-      const b = JSON.parse(depositsJson);
+      const b = payload.deposits.map((d) => ({
+        sku: d.sku,
+        name: d.name,
+        qty: d.quantity,
+        unit: "יח'",
+      }));
       mergedItems = JSON.stringify([...a, ...b]);
     } catch {
       /* keep items only */
@@ -422,7 +398,6 @@ export async function injectOrder(payload: InjectOrderPayload): Promise<InjectOr
   };
 }
 
-/** Update customer number → handleUpdateOrderCustomerNumber_ */
 export async function updateOrderCustomerNumber(
   orderId: string,
   newCustomerNo: string,
@@ -430,16 +405,11 @@ export async function updateOrderCustomerNumber(
 ): Promise<void> {
   await callAppsScript(
     'updateOrderCustomerNumber',
-    {
-      orderId,
-      newCustomerNo,
-      oldCustomerNo: oldCustomerNo || '',
-    },
+    { orderId, newCustomerNo, oldCustomerNo: oldCustomerNo || '' },
     'POST',
   );
 }
 
-/** Orders history – not yet in NewOrder.gs; returns empty until wired */
 export async function getCustomerOrders(_customerNo: string): Promise<
   {
     id: string;
@@ -455,7 +425,6 @@ export async function getCustomerOrders(_customerNo: string): Promise<
   return [];
 }
 
-/** Documents – not yet in NewOrder.gs; returns empty until wired */
 export async function getCustomerDocuments(_customerNo: string): Promise<
   { id: string; date: string; address: string; status: string; url: string; name: string }[]
 > {
