@@ -8,7 +8,7 @@ import { isCustomerProduct, NEW_CUSTOMER_ID, normalizePhone } from './portal-dom
 import { generateOpaqueToken } from './magic-session';
 
 const DEFAULT_WEBAPP_URL =
-  'https://script.google.com/macros/s/AKfycbzXhFhcbhre2kikxoVPFely45DOMHWAd_j4Fu8_yRhWOAWKrCj6jXBO-iHTaWD_qWH4LA/exec';
+  'https://script.google.com/macros/s/AKfycbz3H6sNSxcBfuIhervXRM0V6mkjrp1VoJQ1azdrPL-JUffEf3_2uCudybRDHblFxDZo4w/exec';
 
 const WEBAPP_URL =
   process.env['APPS_SCRIPT_URL'] ??
