@@ -52,7 +52,6 @@ function productImage(sku: string, catalogImage?: string) {
   if (catalogImage && /^https?:\/\//i.test(catalogImage)) {
     return `/api/public/product-image/${sku}`;
   }
-  // Neutral local placeholder (no Lovable CDN)
   return `/icons/icon.svg`;
 }
 
@@ -175,11 +174,7 @@ function Index() {
 
       {saved ? (
         <div className="empty-page">
-          <img
-            className="result-art"
-            src="/icons/icon.svg"
-            alt="ההזמנה נקלטה בהצלחה וממתינה לאישור"
-          />
+          <img className="result-art" src="/icons/icon.svg" alt="ההזמנה נקלטה בהצלחה וממתינה לאישור" />
           <h2 className="text-xl font-bold">ההזמנה שלך נקלטה!</h2>
           <p>ממתינה לאישור ראמי ולשיבוץ האספקה.</p>
           <Button
@@ -198,9 +193,7 @@ function Index() {
           <section>
             <div className="featured-band">
               <div>
-                <div className="text-primary text-xs mb-2">
-                  ח. סבן חומרי בניין • מאז 1994
-                </div>
+                <div className="text-primary text-xs mb-2">ח. סבן חומרי בניין • מאז 1994</div>
                 <h2>
                   {step === 1
                     ? 'כל פרויקט טוב מתחיל באספקה טובה.'
@@ -257,8 +250,8 @@ function Index() {
                 <div className="notice">
                   <Info size={20} className="shrink-0" />
                   <span>
-                    לקוח חדש? אפשר להתחיל להזמין. כרטיס לקוח {NEW_CUSTOMER_ID}{' '}
-                    ישויך לאחר כניסה עם קישור אישי.
+                    לקוח חדש? אפשר להתחיל להזמין. כרטיס לקוח {NEW_CUSTOMER_ID} ישויך לאחר
+                    כניסה עם קישור אישי.
                   </span>
                 </div>
                 <div className="flex items-center justify-between mt-7 mb-4">
@@ -602,7 +595,7 @@ function Field({
         id={`delivery-${name}`}
         type={type}
         value={p.delivery[name]}
-        on multipChange={(e) => p.setDelivery({ ...p.delivery, [name]: e.target.value })}
+        onChange={(e) => p.setDelivery({ ...p.delivery, [name]: e.target.value })}
         maxLength={name === 'notes' ? 1000 : 200}
         {...(type === 'tel' ? { dir: 'ltr' } : {})}
       />
