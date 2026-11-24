@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ח. סבן">
+  <rect width="512" height="512" rx="96" fill="#0f172a"/>
+  <rect x="64" y="320" width="384" height="48" rx="8" fill="#f59e0b"/>
+  <rect x="96" y="240" width="320" height="48" rx="8" fill="#e2e8f0"/>
+  <rect x="128" y="160" width="256" height="48" rx="8" fill="#94a3b8"/>
+  <text x="256" y="420" text-anchor="middle" font-family="Heebo, Arial, sans-serif" font-size="56" font-weight="700" fill="#f8fafc">סבן</text>
+</svg>
